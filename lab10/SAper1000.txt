@@ -1,0 +1,10 @@
+Brazil	511
+Venezuela	110
+Columbia	160
+Equador	1864
+Peru	1439
+Bolivia	148
+Chile	1126
+Paraguay	60
+Argentina	108
+Uruguay 189
