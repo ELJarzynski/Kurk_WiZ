@@ -59,28 +59,45 @@ class PalletMultiViewDataset(Dataset):
 class PalletRegressor(nn.Module):
     def __init__(self):
         super().__init__()
+        # Ładowanie modelu bazowego DINOv2
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
         
-        # Odblokowujemy wagi - przy 10 zestawach to ryzykowne (overfitting), 
-        # ale przy tak dużym błędzie model MUSI się bardziej dostosować.
+        # --- OPTYMALIZACJA SZYBKOŚCI I NAUKI ---
+        # 1. Zamrażamy cały model (żeby karta T4 nie muliła)
         for param in self.backbone.parameters():
-            param.requires_grad = True
+            param.requires_grad = False
             
-        self.embed_dim = self.backbone.embed_dim
+        # 2. Odmrażamy tylko ostatnie 4 bloki Transformera
+        # To pozwala modelowi nauczyć się specyfiki Twoich zdjęć, 
+        # ale drastycznie przyspiesza trening względem odmrożenia całości.
+        for param in self.backbone.blocks[-4:].parameters():
+            for name, reg_param in param.named_parameters():
+                reg_param.requires_grad = True
+            
+        self.embed_dim = self.backbone.embed_dim # Dla vits14 to 384
+        
+        # --- GŁOWICA REGRESYJNA (MLP) ---
         self.regressor = nn.Sequential(
+            # Wejście: 8 widoków * 384 cechy
             nn.Linear(self.embed_dim * NUM_VIEWS, 512),
-            nn.BatchNorm1d(512),
+            nn.BatchNorm1d(512), # Stabilizuje trening przy dużych wartościach
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 1)
+            nn.Dropout(0.3),     # Zapobiega uczeniu się zdjęć na pamięć
+            nn.Linear(512, 1)    # Wynik końcowy (liczba palet / 1000)
         )
 
     def forward(self, x):
+        # x shape: [Batch, Views, C, H, W] -> np. [2, 8, 3, 224, 224]
         b, v, c, h, w = x.shape
+        
+        # Łączymy Batch i Views, żeby przepuścić je przez DINOv2 za jednym razem
+        # Używamy reshape zamiast view, aby uniknąć błędów ciągłości tensora
         x = x.reshape(b * v, c, h, w) 
-        features = self.backbone(x) 
-        features = features.reshape(b, v * self.embed_dim) 
-        return self.regressor(features)
+        
+        # Wyciągamy cechy (features) z każdego zdjęcia
+        features = self.backbone(x) # Shape: [b*v, 384]
+        
+        # Przywracamy wymiar batcha i łączymy)
 
 # 3. TRENING I TEST
 def run_project():
