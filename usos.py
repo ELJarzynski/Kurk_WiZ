@@ -7,21 +7,21 @@ from PIL import Image
 import os
 import math
 
-# --- PARAMETRY POD NVIDIA T4 ---
+# --- PARAMETRY ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_SIZE = 224          # Wielokrotność 14 dla DINOv2 
-NUM_VIEWS = 8           # 8 zdjęć na magazyn
-BATCH_SIZE = 4          # Optymalne dla T4 (8 zdjęć * 4 = 32 obrazy na batch) [1]
-EPOCHS = 100            # Przy 10 zestawach potrzebujemy więcej epok na zbieżność
-LEARNING_RATE = 1e-4    # Niskie LR dla Transformerów [2, 3]
+IMG_SIZE = 224
+NUM_VIEWS = 8
+BATCH_SIZE = 4 
+EPOCHS = 100
+LEARNING_RATE = 1e-4
 
-# 1. DATASET: Ładowanie 8 ujęć jako jedna scena
+# 1. DATASET: Obsługa struktury DataSet/Set*/
 class PalletMultiViewDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
-        # Szukamy tylko folderów
-        self.scenes = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
+        # Szukamy folderów Set1, Set2 itd. wewnątrz DataSet
+        self.scenes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
 
     def __len__(self):
         return len(self.scenes)
@@ -30,64 +30,76 @@ class PalletMultiViewDataset(Dataset):
         scene_name = self.scenes[idx]
         scene_path = os.path.join(self.root_dir, scene_name)
         
-        # Pobieramy pliki graficzne, sortujemy dla spójności ujęć
+        # Pobieramy obrazy i sortujemy je
         img_names = sorted([f for f in os.listdir(scene_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
+        
         if len(img_names) < NUM_VIEWS:
-            raise ValueError(f"Folder {scene_name} ma za mało zdjęć! Wymagane {NUM_VIEWS}.")
+            # Jeśli zdjęć jest więcej, bierzemy pierwsze 8. Jeśli mniej - błąd.
+            raise ValueError(f"Folder {scene_name} ma tylko {len(img_names)} zdjęć! Wymagane {NUM_VIEWS}.")
 
-        images =
+        images = []
         for i in range(NUM_VIEWS):
             img = Image.open(os.path.join(scene_path, img_names[i])).convert('RGB')
             if self.transform:
                 img = self.transform(img)
             images.append(img)
             
-        # Tensor: 
-        images = torch.stack(images)
+        images = torch.stack(images) # [NUM_VIEWS, 3, 224, 224]
         
-        # Etykieta z nazwy folderu: "magazyn_1_count_12" -> 12.0 [4, 5]
-        label = float(scene_name.split('_')[-1])
-        return images, torch.tensor([label], dtype=torch.float32)
+        # LOGIKA ETYKIETY: "1_1_1809" -> bierzemy ostatnią część jako wartość do regresji
+        try:
+            label_value = float(scene_name.split('_')[-1])
+        except ValueError:
+            label_value = 0.0 # Backup
+            
+        return images, torch.tensor([label_value], dtype=torch.float32)
 
-# 2. MODEL: DINOv2 z głowicą regresyjną
+# 2. MODEL: DINOv2 z fuzją widoków
 class PalletRegressor(nn.Module):
     def __init__(self):
         super().__init__()
-        # DINOv2 wyciąga lepsze cechy geometryczne niż zwykły ViT 
+        # Ładowanie DINOv2 (ViT-S/14)
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
         
-        # Zamrażamy backbone, bo przy 10 zestawach danych szybko go "zepsujesz" (overfitting)
+        # Zamrożenie wag backbone'u dla małych zbiorów danych
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        self.embed_dim = self.backbone.embed_dim # 384 dla vits14
+        self.embed_dim = self.backbone.embed_dim # 384
         
-        # Agregator widoków i regresja liniowa [6, 4]
         self.regressor = nn.Sequential(
             nn.Linear(self.embed_dim * NUM_VIEWS, 512),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, 1) # Wynik: liczba palet
+            nn.Linear(512, 1)
         )
 
     def forward(self, x):
+        # x shape: [Batch, Views, C, H, W]
         b, v, c, h, w = x.shape
-        x = x.view(b * v, c, h, w) # Spłaszczamy batch dla backbone'u
+        x = x.view(b * v, c, h, w) 
         
-        features = self.backbone(x) # [b*8, 384]
+        features = self.backbone(x) # [b*v, 384]
         
-        features = features.view(b, v * self.embed_dim) # Fuzja widoków [b, 8*384]
+        # Łączymy cechy ze wszystkich 8 zdjęć w jeden długi wektor
+        features = features.view(b, v * self.embed_dim) 
         return self.regressor(features)
 
-# 3. METRYKI I TRENING
+# 3. URUCHOMIENIE
 def run_project():
-    # Preprocessing (ImageNet stats dla DINOv2) 
-    transform = transforms.Compose(, std=[0.229, 0.224, 0.225]),
+    transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    full_dataset = PalletMultiViewDataset(root_dir='./data', transform=transform)
+    # Upewnij się, że ścieżka prowadzi do głównego folderu "DataSet"
+    full_dataset = PalletMultiViewDataset(root_dir='./DataSet', transform=transform)
     
-    # Podział na train/val (np. 8 scen trening, 2 sceny walidacja)
+    if len(full_dataset) < 2:
+        print("Za mało danych w folderze DataSet!")
+        return
+
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
@@ -97,13 +109,13 @@ def run_project():
 
     model = PalletRegressor().to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.L1Loss() # MAE - najlepsza do liczenia sztuk 
+    criterion = nn.MSELoss() # Przy regresji MSE często lepiej zbiega niż L1
 
-    print(f"Trening na T4 | Rozmiar batcha: {BATCH_SIZE} | Próbki: {len(full_dataset)}")
+    print(f"Start: {len(full_dataset)} scen, Urządzenie: {DEVICE}")
 
     for epoch in range(EPOCHS):
         model.train()
-        train_loss = 0
+        total_train_loss = 0
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             
@@ -112,25 +124,20 @@ def run_project():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
+            total_train_loss += loss.item()
 
-        # EWALUACJA I METRYKI
-        model.eval()
-        mae, mse = 0, 0
-        with torch.no_grad():
-            for imgs, labels in val_loader:
-                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-                preds = model(imgs)
-                mae += torch.abs(preds - labels).item()
-                mse += torch.pow(preds - labels, 2).item()
-        
-        val_mae = mae / len(val_loader)
-        val_rmse = math.sqrt(mse / len(val_loader))
-
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoka {epoch+1:03d} | Train MAE: {train_loss/len(train_loader):.2f} | Val MAE: {val_mae:.2f} | Val RMSE: {val_rmse:.2f}")
-
-    print("\nTrening zakończony. Model potrafi oszacować liczbę palet.")
+        # Walidacja co 5 epok
+        if (epoch + 1) % 5 == 0:
+            model.eval()
+            mae = 0
+            with torch.no_grad():
+                for imgs, labels in val_loader:
+                    imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                    preds = model(imgs)
+                    mae += torch.abs(preds - labels).item()
+            
+            avg_mae = mae / len(val_loader)
+            print(f"Epoka {epoch+1:03d} | Loss: {total_train_loss/len(train_loader):.4f} | Val MAE: {avg_mae:.2f}")
 
 if __name__ == "__main__":
     run_project()
