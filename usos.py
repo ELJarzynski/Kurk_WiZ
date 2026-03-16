@@ -113,6 +113,35 @@ def run_project():
 
     print(f"Start: {len(full_dataset)} scen, Urządzenie: {DEVICE}")
 
+    def check_pallet_errors(model, val_loader, device):
+    model.eval()
+    print("\n--- ANALIZA BŁĘDÓW (W SZTUKACH) ---")
+    print(f"{'Folder/ID':<15} | {'Prawda':>10} | {'Predykcja':>10} | {'Błąd (szt)':>12}")
+    print("-" * 55)
+
+    total_error = 0
+    count = 0
+
+    with torch.no_grad():
+        for i, (imgs, labels) in enumerate(val_loader):
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            
+            # .item() wyciąga pojedynczą liczbę z tensora
+            prawdziwe = labels.item()
+            przewidziane = outputs.item()
+            blad = abs(prawdziwe - przewidziane)
+            
+            total_error += blad
+            count += 1
+            
+            print(f"Scena {i+1:<8} | {prawdziwe:10.2f} | {przewidziane:10.2f} | {blad:12.2f}")
+
+    sredni_blad = total_error / count
+    print("-" * 55)
+    print(f"Średnio mylę się o: {sredni_blad:.2f} palety")
+    print("-----------------------------------\n")
+
     for epoch in range(EPOCHS):
         model.train()
         total_train_loss = 0
@@ -138,6 +167,8 @@ def run_project():
             
             avg_mae = mae / len(val_loader)
             print(f"Epoka {epoch+1:03d} | Loss: {total_train_loss/len(train_loader):.4f} | Val MAE: {avg_mae:.2f}")
+    print("Trening zakończony. Rozpoczynam dokładną ewaluację...")
+    check_pallet_errors(model, val_loader, DEVICE)
 
 if __name__ == "__main__":
     run_project()
