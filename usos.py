@@ -208,31 +208,97 @@ class PalletMultiViewDataset(Dataset):
             
         return torch.stack(images), torch.tensor([label_value], dtype=torch.float32)
 
-# --- POPRAWIONA FUNKCJA URUCHAMIAJĄCA ---
 def run_project():
-    # ... (tutaj Twoje transformacje) ...
+    # 1. Preprocessing dla DINOv2
+    transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
+    # 2. Inicjalizacja Datasetu
+    # Upewnij się, że ścieżka './DataSet' jest poprawna
     full_dataset = PalletMultiViewDataset(root_dir='./DataSet', transform=transform)
     
-    # RĘCZNY PODZIAŁ: 8 TRENING, 1 WALIDACJA, 1 TEST
-    # Skoro masz 10 elementów: indices 0-7 (train), 8 (val), 9 (test)
-    indices = list(range(len(full_dataset)))
-    
+    num_total = len(full_dataset)
+    if num_total < 10:
+        print(f"UWAGA: Masz tylko {num_total} zestawów. Kod jest ustawiony pod 10.")
+
+    # 3. MANUALNY PODZIAŁ (Indeksy: 0-7 trening, 8 walidacja, 9 test)
+    indices = list(range(num_total))
     train_indices = indices[0:8]
     val_indices   = indices[8:9]
     test_indices  = indices[9:10]
-    
-    print(f"\n--- PODZIAŁ DANYCH ---")
-    print(f"Treningowe (8): {[full_dataset.scenes[i] for i in train_indices]}")
-    print(f"Walidacyjne (1): {[full_dataset.scenes[i] for i in val_indices]}")
-    print(f"Testowe     (1): {[full_dataset.scenes[i] for i in test_indices]}")
-    
+
+    print("\n" + "="*40)
+    print(f"PODZIAŁ DANYCH:")
+    print(f"TRENING (8):    {[full_dataset.scenes[i] for i in train_indices]}")
+    print(f"WALIDACJA (1):  {[full_dataset.scenes[i] for i in val_indices]}")
+    print(f"TEST (1):       {[full_dataset.scenes[i] for i in test_indices]}")
+    print("="*40 + "\n")
+
     train_ds = torch.utils.data.Subset(full_dataset, train_indices)
     val_ds   = torch.utils.data.Subset(full_dataset, val_indices)
     test_ds  = torch.utils.data.Subset(full_dataset, test_indices)
 
+    # 4. DataLoadery
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader   = DataLoader(val_ds, batch_size=1)
     test_loader  = DataLoader(test_ds, batch_size=1)
 
-    # Dalej leci trening...
+    # 5. Model, Optimizer, Criterion
+    model = PalletRegressor().to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    criterion = nn.MSELoss() 
+
+    # 6. PĘTLA TRENINGOWA
+    print(f"Rozpoczynam trening na {DEVICE}...")
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        # Walidacja co 10 epok
+        if (epoch + 1) % 10 == 0:
+            model.eval()
+            val_mae = 0
+            with torch.no_grad():
+                for imgs, labels in val_loader:
+                    imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                    preds = model(imgs)
+                    val_mae += torch.abs(preds - labels).item()
+            
+            print(f"Epoka {epoch+1:03d}/{EPOCHS} | Train Loss: {train_loss/len(train_loader):.4f} | Val MAE: {val_mae/len(val_loader):.2f}")
+
+    # 7. FINALNY TEST (Wykorzystanie TEST_LOADERA)
+    print("\n" + "!"*40)
+    print("URUCHAMIAM TEST KOŃCOWY (ZBIÓR TESTOWY)")
+    print("!"*40)
+    
+    model.eval()
+    with torch.no_grad():
+        for imgs, labels in test_loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            preds = model(imgs)
+            
+            poczatek_sceny = full_dataset.scenes[test_indices[0]]
+            y_pred = preds.item()
+            y_true = labels.item()
+            
+            print(f"WYNIK DLA FOLDERU: {poczatek_sceny}")
+            print(f"  -> PRZEWIDZIANO: {y_pred:.2f} palet")
+            print(f"  -> PRAWDA:       {y_true:.2f} palet")
+            print(f"  -> RÓŻNICA:      {abs(y_pred - y_true):.2f}")
+    
+    print("\nTrening i test zakończony.")
+
+if __name__ == "__main__":
+    run_project()
