@@ -15,12 +15,14 @@ BATCH_SIZE = 4
 EPOCHS = 100
 LEARNING_RATE = 1e-4
 
-# 1. DATASET: Obsługa struktury DataSet/Set*/
+# 1. DATASET: Ładowanie 8 ujęć z folderów Set* w DataSet/
 class PalletMultiViewDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
-        # Szukamy folderów Set1, Set2 itd. wewnątrz DataSet
+        # Szukamy folderów (scen) w DataSet i sortujemy je
+        if not os.path.exists(root_dir):
+            raise FileNotFoundError(f"Nie znaleziono folderu: {root_dir}")
         self.scenes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
 
     def __len__(self):
@@ -30,12 +32,10 @@ class PalletMultiViewDataset(Dataset):
         scene_name = self.scenes[idx]
         scene_path = os.path.join(self.root_dir, scene_name)
         
-        # Pobieramy obrazy i sortujemy je
         img_names = sorted([f for f in os.listdir(scene_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
         
         if len(img_names) < NUM_VIEWS:
-            # Jeśli zdjęć jest więcej, bierzemy pierwsze 8. Jeśli mniej - błąd.
-            raise ValueError(f"Folder {scene_name} ma tylko {len(img_names)} zdjęć! Wymagane {NUM_VIEWS}.")
+            raise ValueError(f"Folder {scene_name} ma za mało zdjęć ({len(img_names)})! Wymagane {NUM_VIEWS}.")
 
         images = []
         for i in range(NUM_VIEWS):
@@ -44,24 +44,23 @@ class PalletMultiViewDataset(Dataset):
                 img = self.transform(img)
             images.append(img)
             
-        images = torch.stack(images) # [NUM_VIEWS, 3, 224, 224]
+        images = torch.stack(images)
         
-        # LOGIKA ETYKIETY: "1_1_1809" -> bierzemy ostatnią część jako wartość do regresji
+        # Pobieranie liczby palet z nazwy folderu (np. "1_1_1809" -> 1809.0)
         try:
             label_value = float(scene_name.split('_')[-1])
-        except ValueError:
-            label_value = 0.0 # Backup
+        except (ValueError, IndexError):
+            label_value = 0.0
             
         return images, torch.tensor([label_value], dtype=torch.float32)
 
-# 2. MODEL: DINOv2 z fuzją widoków
+# 2. MODEL: DINOv2 z poprawionym kształtem tensorów (reshape)
 class PalletRegressor(nn.Module):
     def __init__(self):
         super().__init__()
-        # Ładowanie DINOv2 (ViT-S/14)
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
         
-        # Zamrożenie wag backbone'u dla małych zbiorów danych
+        # Zamrożenie backbone'u
         for param in self.backbone.parameters():
             param.requires_grad = False
             
@@ -75,17 +74,41 @@ class PalletRegressor(nn.Module):
         )
 
     def forward(self, x):
-        # x shape: [Batch, Views, C, H, W]
         b, v, c, h, w = x.shape
-        x = x.view(b * v, c, h, w) 
+        # Używamy reshape zamiast view, aby uniknąć błędu "contiguous"
+        x = x.reshape(b * v, c, h, w) 
         
-        features = self.backbone(x) # [b*v, 384]
+        features = self.backbone(x)
         
-        # Łączymy cechy ze wszystkich 8 zdjęć w jeden długi wektor
-        features = features.view(b, v * self.embed_dim) 
+        # Łączymy cechy ze wszystkich 8 ujęć
+        features = features.reshape(b, v * self.embed_dim) 
         return self.regressor(features)
 
-# 3. URUCHOMIENIE
+# 3. FUNKCJA ANALIZY BŁĘDÓW
+def check_pallet_errors(model, loader, device, title="WALIDACJA"):
+    model.eval()
+    print(f"\n--- {title}: PORÓWNANIE W SZTUKACH ---")
+    print(f"{'Nr':<3} | {'Prawda':>10} | {'Predykcja':>10} | {'Błąd (szt)':>10}")
+    print("-" * 45)
+
+    total_error = 0
+    with torch.no_grad():
+        for i, (imgs, labels) in enumerate(loader):
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            
+            real = labels.item()
+            pred = outputs.item()
+            diff = abs(real - pred)
+            total_error += diff
+            
+            print(f"{i+1:<3} | {real:10.2f} | {pred:10.2f} | {diff:10.2f}")
+
+    avg_err = total_error / len(loader)
+    print("-" * 45)
+    print(f"Średni błąd w tej grupie: {avg_err:.2f} palety\n")
+
+# 4. GŁÓWNA PĘTLA
 def run_project():
     transform = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -93,13 +116,10 @@ def run_project():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # Upewnij się, że ścieżka prowadzi do głównego folderu "DataSet"
+    # UWAGA: Upewnij się, że folder nazywa się dokładnie "DataSet"
     full_dataset = PalletMultiViewDataset(root_dir='./DataSet', transform=transform)
     
-    if len(full_dataset) < 2:
-        print("Za mało danych w folderze DataSet!")
-        return
-
+    # Podział na train i val (8 folderów trening, 2 walidacja)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
@@ -109,42 +129,14 @@ def run_project():
 
     model = PalletRegressor().to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.MSELoss() # Przy regresji MSE często lepiej zbiega niż L1
+    criterion = nn.MSELoss() 
 
     print(f"Start: {len(full_dataset)} scen, Urządzenie: {DEVICE}")
 
-    def check_pallet_errors(model, val_loader, device):
-    model.eval()
-    print("\n--- ANALIZA BŁĘDÓW (W SZTUKACH) ---")
-    print(f"{'Folder/ID':<15} | {'Prawda':>10} | {'Predykcja':>10} | {'Błąd (szt)':>12}")
-    print("-" * 55)
-
-    total_error = 0
-    count = 0
-
-    with torch.no_grad():
-        for i, (imgs, labels) in enumerate(val_loader):
-            imgs, labels = imgs.to(device), labels.to(device)
-            outputs = model(imgs)
-            
-            # .item() wyciąga pojedynczą liczbę z tensora
-            prawdziwe = labels.item()
-            przewidziane = outputs.item()
-            blad = abs(prawdziwe - przewidziane)
-            
-            total_error += blad
-            count += 1
-            
-            print(f"Scena {i+1:<8} | {prawdziwe:10.2f} | {przewidziane:10.2f} | {blad:12.2f}")
-
-    sredni_blad = total_error / count
-    print("-" * 55)
-    print(f"Średnio mylę się o: {sredni_blad:.2f} palety")
-    print("-----------------------------------\n")
-
+    # Trening
     for epoch in range(EPOCHS):
         model.train()
-        total_train_loss = 0
+        train_loss = 0
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             
@@ -153,22 +145,17 @@ def run_project():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            total_train_loss += loss.item()
+            train_loss += loss.item()
 
-        # Walidacja co 5 epok
-        if (epoch + 1) % 5 == 0:
-            model.eval()
-            mae = 0
-            with torch.no_grad():
-                for imgs, labels in val_loader:
-                    imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-                    preds = model(imgs)
-                    mae += torch.abs(preds - labels).item()
-            
-            avg_mae = mae / len(val_loader)
-            print(f"Epoka {epoch+1:03d} | Loss: {total_train_loss/len(train_loader):.4f} | Val MAE: {avg_mae:.2f}")
-    print("Trening zakończony. Rozpoczynam dokładną ewaluację...")
-    check_pallet_errors(model, val_loader, DEVICE)
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoka {epoch+1:03d}/{EPOCHS} | Train Loss: {train_loss/len(train_loader):.4f}")
+
+    # --- FINALNA EWALUACJA ---
+    # Sprawdzamy na danych, których model NIE widział
+    check_pallet_errors(model, val_loader, DEVICE, title="WYNIKI WALIDACJI")
+    
+    # Opcjonalnie: sprawdźmy też na treningowych, żeby zobaczyć czy model je zapamiętał
+    # check_pallet_errors(model, DataLoader(train_ds, batch_size=1), DEVICE, title="WYNIKI TRENINGOWE")
 
 if __name__ == "__main__":
     run_project()
