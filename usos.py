@@ -435,79 +435,79 @@ def run_project():
 
 
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms
 
 def run_project():
+    """
+    Main orchestration function: 
+    Trains on Datasets 1-9 and evaluates on Dataset 10 (Hold-out Test Set).
+    """
     # 1. Pre-processing Pipeline
     transform = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
     ])
 
-    # Lista nazw Twoich podfolderów (Dataset1, Dataset2, itd.)
-    # Zakładam, że są one bezpośrednio w katalogu "./DataSet"
-    dataset_names = [f"Dataset{i}" for i in range(1, 11)]
-    results = {}
-
-    # Główna pętla Cross-Validation (10 iteracji)
-    for test_folder in dataset_names:
-        print(f"\n--- Ewaluacja na zbiorze: {test_folder} ---")
-        
-        # Tworzymy listy folderów treningowych (wszystkie poza testowym)
-        train_folders = [d for d in dataset_names if d != test_folder]
-
-        # 2. Przygotowanie danych (wymaga modyfikacji klasy Dataset, aby filtrowała po folderach)
-        # Zakładam, że PalletMultiViewDataset przyjmuje argument subfolders
-        train_ds = PalletMultiViewDataset("./DataSet", subfolders=train_folders, transform=transform)
-        test_ds  = PalletMultiViewDataset("./DataSet", subfolders=[test_folder], transform=transform)
-
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-        test_loader  = DataLoader(test_ds, batch_size=1)
-
-        # Statystyki celu (Z-score) dla zbioru treningowego
-        all_train_labels = torch.tensor([train_ds[i][1].item() for i in range(len(train_ds))])
-        _, mean, std = normalize_targets(all_train_labels)
-
-        # 3. Model & Optimization Setup (Reset modelu w każdej iteracji!)
-        model = DinoRegressorPRO().to(DEVICE)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-        criterion = nn.L1Loss()
-
-        # 4. Pętla Treningowa
-        for epoch in range(EPOCHS):
-            model.train()
-            total_loss = 0
-            for imgs, labels, _ in train_loader:
-                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-                labels_norm = (labels - mean) / std
-
-                optimizer.zero_grad()
-                pred_norm = model(imgs)
-                loss = criterion(pred_norm, labels_norm)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            
-            if (epoch + 1) % 5 == 0:
-                print(f"Dataset {test_folder} | Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss:.4f}")
-
-        # 5. Ewaluacja finalna dla danego folderu
-        model.eval()
-        total_mae = 0
-        with torch.no_grad():
-            for imgs, labels, _ in test_loader:
-                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-                pred = model(imgs) * std + mean
-                total_mae += abs(pred.item() - labels.item())
-        
-        avg_mae = total_mae / len(test_loader)
-        results[test_folder] = avg_mae
-        print(f"ZAKOŃCZONO: Błąd (MAE) dla {test_folder}: {avg_mae:.4f}")
-
-    # 6. Podsumowanie wyników
-    print("\n" + "="*30)
-    print("FINALNE WYNIKI DLA KAŻDEGO DATASETU:")
-    for ds_name, error in results.items():
-        print(f"{ds_name}: MAE = {error:.4f}")
+    # 2. Data Preparation
+    full_dataset = PalletMultiViewDataset("./DataSet", transform=transform)
     
-    avg_total_mae = sum(results.values()) / len(results)
-    print(f"\nŚredni błąd ze wszystkich prób: {avg_total_mae:.4f}")
+    # Logic to separate: Train on Set1-Set9, Test on Set10
+    # We identify indices where "Set10" is NOT in the folder name for training
+    train_indices = [i for i, scene in enumerate(full_dataset.scenes) if "Set10" not in scene]
+    # We identify indices where "Set10" IS in the folder name for testing
+    test_indices = [i for i, scene in enumerate(full_dataset.scenes) if "Set10" in scene]
+
+    # Create Subsets based on the identified indices
+    train_ds = Subset(full_dataset, train_indices)
+    test_ds = Subset(full_dataset, test_indices)
+
+    # DataLoaders for the split
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+    test_loader  = DataLoader(test_ds, batch_size=1)
+
+    # Calculate target statistics ONLY from the training sets (1-9) to prevent leakage
+    train_labels = torch.tensor([full_dataset[i][1].item() for i in train_indices])
+    t_mean, t_std = train_labels.mean(), train_labels.std()
+
+    # 3. Model & Optimization Setup
+    model = DinoRegressorPRO().to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    criterion = nn.L1Loss()
+
+    print(f"Starting Training (Sets 1-9)... Testing on Set 10.")
+    print(f"Train samples: {len(train_ds)} | Test samples: {len(test_ds)}")
+
+    train_losses = []
+
+    # 4. Training Loop
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        
+        for imgs, labels, _ in train_loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            
+            # Normalize target using training set statistics
+            labels_norm = (labels - t_mean) / t_std
+
+            optimizer.zero_grad()
+            pred_norm = model(imgs)
+            loss = criterion(pred_norm, labels_norm)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        train_losses.append(total_loss)
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss:.4f}")
+
+    # 5. Final Evaluation on the unseen Set 10
+    print("\n" + "="*20 + " FINAL EVALUATION ON SET 10 " + "="*20)
+    evaluate(model, test_loader, t_mean, t_std)
+    
+    # 6. Visualization
+    # Note: val_maes is empty here as we focus on the final test set
+    plot_metrics(train_losses, [None] * len(train_losses))
