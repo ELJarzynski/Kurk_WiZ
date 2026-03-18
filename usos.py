@@ -386,4 +386,75 @@ def run_project():
     # 6. Final Test and Visualization
     evaluate(model, test_loader, mean, std)
     plot_metrics(train_losses, val_maes)
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+
+def plot_metrics(train_losses: list, val_maes: list):
+    """
+    Generate production-quality diagnostic plots for model training and validation.
     
+    Features:
+    - Adaptive smoothing (SMA) for loss trends.
+    - Automated 'Best Model' annotation for validation metrics.
+    - Professional Seaborn aesthetics for technical reporting.
+    """
+    # Set sophisticated visual style for professional reporting
+    sns.set_theme(style="whitegrid", context="talk")
+    plt.rcParams["font.family"] = "sans-serif"
+    
+    epochs = np.arange(1, len(train_losses) + 1)
+    
+    # Handle sparse validation data (aligning non-None values with their respective epochs)
+    val_epochs = [i + 1 for i, v in enumerate(val_maes) if v is not None]
+    val_values = [v for v in val_maes if v is not None]
+
+    fig, ax = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # --- SUBPLOT 1: Training Loss Convergence ---
+    # Plot raw loss with low alpha to show variance
+    sns.lineplot(x=epochs, y=train_losses, ax=ax[0], color='#2c3e50', alpha=0.3, label='Raw Loss')
+    
+    # Apply Simple Moving Average (SMA) to highlight the learning trajectory
+    if len(train_losses) > 5:
+        smoothed_loss = pd.Series(train_losses).rolling(window=5, min_periods=1).mean()
+        sns.lineplot(x=epochs, y=smoothed_loss, ax=ax[0], color='#e74c3c', linewidth=2.5, label='Trend (SMA-5)')
+    
+    ax[0].set_title("Training Loss Convergence", pad=20, fontweight='bold')
+    ax[0].set_xlabel("Epochs")
+    ax[0].set_ylabel("Loss Magnitude")
+    ax[0].legend(frameon=True, loc='upper right')
+
+    # --- SUBPLOT 2: Validation Performance (MAE) ---
+    if val_values:
+        # Plot validation points connected by a high-contrast line
+        sns.lineplot(x=val_epochs, y=val_values, ax=ax[1], color='#2980b9', 
+                     marker='o', markersize=8, linewidth=2.5, label='Validation MAE')
+        
+        # Identify and annotate the optimal performance point
+        best_mae = min(val_values)
+        best_epoch = val_epochs[val_values.index(best_mae)]
+        
+        # Add dynamic annotation for the 'Best Model' checkpoint
+        ax[1].annotate(f'Best MAE: {best_mae:.2f}', 
+                       xy=(best_epoch, best_mae), 
+                       xytext=(best_epoch, best_mae + (max(val_values) - min(val_values)) * 0.15),
+                       arrowprops=dict(facecolor='black', shrink=0.05, width=1.2, headwidth=8),
+                       horizontalalignment='center', 
+                       fontweight='bold',
+                       bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2980b9", alpha=0.8))
+
+    ax[1].set_title("Validation Accuracy (MAE)", pad=20, fontweight='bold')
+    ax[1].set_xlabel("Epochs")
+    ax[1].set_ylabel("Mean Absolute Error")
+    
+    # Clean up plot borders for a modern look
+    sns.despine()
+    plt.tight_layout()
+    
+    # Optional: Export at high resolution for presentations
+    # plt.savefig("model_performance_report.png", dpi=300, bbox_inches='tight')
+    plt.show()
