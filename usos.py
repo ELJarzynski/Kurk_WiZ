@@ -458,3 +458,128 @@ def plot_metrics(train_losses: list, val_maes: list):
     # Optional: Export at high resolution for presentations
     # plt.savefig("model_performance_report.png", dpi=300, bbox_inches='tight')
     plt.show()
+
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms
+import copy
+
+def run_project():
+    """
+    Main orchestration function for model training, validation, and convergence.
+    
+    This pipeline implements:
+    1. Data Preprocessing & Partitioning (80/10/10 ratio).
+    2. Dynamic Target Normalization (Z-score scaling).
+    3. Training loop with Early Stopping based on Validation MAE.
+    4. Best Model Checkpointing (Automatic restoration of optimal weights).
+    """
+    
+    # --- Configuration & Hyperparameters ---
+    MAX_EPOCHS = 10000    # High limit to allow full convergence to global minimum
+    PATIENCE = 50         # Stop if no improvement after 50 validation cycles
+    VALIDATION_FREQ = 5   # Frequency of validation performance checks
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Data Transformation Pipeline
+    # Using 224x224 as the standard input resolution for DINOv2
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)), 
+        transforms.ToTensor(),
+    ])
+
+    # 2. Dataset Initialization & Splitting
+    dataset = PalletMultiViewDataset("./DataSet", transform=transform)
+    
+    # Splitting logic to ensure a dedicated test set for final evaluation
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size])
+
+    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=1)
+    
+    # 3. Target Statistics for Z-score Normalization
+    # Normalizing labels stabilizes the loss landscape for the AdamW optimizer
+    all_labels = torch.tensor([dataset[i][1].item() for i in range(len(dataset))])
+    _, target_mean, target_std = normalize_targets(all_labels)
+
+    # 4. Model, Optimizer, and Loss Initialization
+    model = DinoRegressorPRO().to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    criterion = nn.L1Loss() # MAE is more robust than MSE for this regression task
+
+    # 5. Tracking Variables for Convergence & Checkpointing
+    best_val_mae = float('inf')
+    epochs_no_improve = 0
+    best_model_wts = copy.deepcopy(model.state_dict())
+    
+    train_losses = []
+    val_maes = []
+
+    print(f"--- Starting Convergence Training on {DEVICE} ---")
+
+    for epoch in range(MAX_EPOCHS):
+        # --- TRAINING PHASE ---
+        model.train()
+        running_epoch_loss = 0
+        for imgs, labels, _ in train_loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            
+            # Target normalization to standardized units
+            labels_norm = (labels - target_mean) / target_std
+
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels_norm)
+            loss.backward()
+            optimizer.step()
+            
+            running_epoch_loss += loss.item()
+
+        train_losses.append(running_epoch_loss)
+
+        # --- VALIDATION PHASE (Early Stopping Logic) ---
+        if (epoch + 1) % VALIDATION_FREQ == 0:
+            model.eval()
+            current_val_mae_sum = 0
+            with torch.no_grad():
+                for imgs, labels, _ in val_loader:
+                    imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                    
+                    # Inference & Denormalization to human-readable units (pallet count)
+                    preds_norm = model(imgs)
+                    preds = preds_norm * target_std + target_mean
+                    
+                    current_val_mae_sum += torch.abs(preds - labels).item()
+            
+            avg_val_mae = current_val_mae_sum / len(val_loader)
+            val_maes.append(avg_val_mae)
+            
+            print(f"Epoch {epoch+1:04d} | Loss: {running_epoch_loss:.4f} | Val MAE: {avg_val_mae:.4f}")
+
+            # Improvement Check
+            if avg_val_mae < best_val_mae:
+                best_val_mae = avg_val_mae
+                best_model_wts = copy.deepcopy(model.state_dict()) # Save best weights in memory
+                epochs_no_improve = 0
+                print("  >> New Global Minimum Detected. Checkpoint updated.")
+            else:
+                epochs_no_improve += 1
+        else:
+            val_maes.append(None) # Placeholders for consistent plotting indices
+
+        # Termination Criteria: Stop when model reaches a performance plateau
+        if epochs_no_improve >= PATIENCE:
+            print(f"\nConvergence reached. Early stopping triggered at epoch {epoch+1}.")
+            break
+
+    # 6. Post-Training: Final Parameter Restoration
+    model.load_state_dict(best_model_wts)
+    torch.save(model.state_dict(), "best_pallet_regressor_final.pth")
+    print(f"Process Complete. Optimal Validation MAE: {best_val_mae:.4f}")
+    
+    return train_losses, val_maes, test_ds, target_mean, target_std
