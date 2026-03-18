@@ -310,6 +310,49 @@ def evaluate(model: nn.Module, loader: DataLoader, mean: float, std: float):
     print("\nSample Predictions vs Ground Truth:")
     for p, t in zip(preds_list[:10], trues_list[:10]):  # Showing first 10 for brevity
         print(f"Pred: {p:.2f} | True: {t:.2f} | Diff: {abs(p - t):.2f}")
+def evaluate(model: nn.Module, loader: DataLoader, mean: float, std: float):
+    """
+    Performs a comprehensive evaluation of the model on a given dataset.
+    
+    Metrics calculated:
+    - MAE: Mean Absolute Error (Directly interpretable as pallet count error).
+    - RMSE: Root Mean Squared Error (Penalizes larger outliers).
+    - MARE: Mean Absolute Relative Error (Error percentage relative to target).
+    """
+    model.eval()
+    preds_list = []
+    trues_list = []
+
+    with torch.no_grad():
+        for imgs, labels, names in loader:
+            imgs = imgs.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            # Inference on normalized space
+            pred_norm = model(imgs)
+            
+            # Denormalization: Convert predictions back to actual pallet counts
+            pred = pred_norm * std + mean
+            
+            preds_list.append(pred.item())
+            trues_list.append(labels.item())
+
+    preds = torch.tensor(preds_list)
+    trues = torch.tensor(trues_list)
+
+    # Statistical Metric Calculations
+    mae = torch.mean(torch.abs(preds - trues))
+    rmse = torch.sqrt(torch.mean((preds - trues) ** 2))
+    mare = torch.mean(torch.abs(trues - preds) / (trues + 1e-7))
+
+    print(f"\n{'='*5} FULL EVALUATION {'='*5}")
+    print(f"MAE:   {mae:.2f}")
+    print(f"RMSE:  {rmse:.2f}")
+    print(f"MARE:  {mare:.4f} (~{mare*100:.2f}%)")
+
+    print("\nSample Predictions vs Ground Truth:")
+    for p, t in zip(preds_list[:10], trues_list[:10]):  # Showing first 10 for brevity
+        print(f"Pred: {p:.2f} | True: {t:.2f} | Diff: {abs(p - t):.2f}")
 
 def run_project():
     """
@@ -386,304 +429,3 @@ def run_project():
     # 6. Final Test and Visualization
     evaluate(model, test_loader, mean, std)
     plot_metrics(train_losses, val_maes)
-
-
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import numpy as np
-
-def plot_metrics(train_losses: list, val_maes: list):
-    """
-    Generate production-quality diagnostic plots for model training and validation.
-    
-    Features:
-    - Adaptive smoothing (SMA) for loss trends.
-    - Automated 'Best Model' annotation for validation metrics.
-    - Professional Seaborn aesthetics for technical reporting.
-    """
-    # Set sophisticated visual style for professional reporting
-    sns.set_theme(style="whitegrid", context="talk")
-    plt.rcParams["font.family"] = "sans-serif"
-    
-    epochs = np.arange(1, len(train_losses) + 1)
-    
-    # Handle sparse validation data (aligning non-None values with their respective epochs)
-    val_epochs = [i + 1 for i, v in enumerate(val_maes) if v is not None]
-    val_values = [v for v in val_maes if v is not None]
-
-    fig, ax = plt.subplots(1, 2, figsize=(16, 7))
-    
-    # --- SUBPLOT 1: Training Loss Convergence ---
-    # Plot raw loss with low alpha to show variance
-    sns.lineplot(x=epochs, y=train_losses, ax=ax[0], color='#2c3e50', alpha=0.3, label='Raw Loss')
-    
-    # Apply Simple Moving Average (SMA) to highlight the learning trajectory
-    if len(train_losses) > 5:
-        smoothed_loss = pd.Series(train_losses).rolling(window=5, min_periods=1).mean()
-        sns.lineplot(x=epochs, y=smoothed_loss, ax=ax[0], color='#e74c3c', linewidth=2.5, label='Trend (SMA-5)')
-    
-    ax[0].set_title("Training Loss Convergence", pad=20, fontweight='bold')
-    ax[0].set_xlabel("Epochs")
-    ax[0].set_ylabel("Loss Magnitude")
-    ax[0].legend(frameon=True, loc='upper right')
-
-    # --- SUBPLOT 2: Validation Performance (MAE) ---
-    if val_values:
-        # Plot validation points connected by a high-contrast line
-        sns.lineplot(x=val_epochs, y=val_values, ax=ax[1], color='#2980b9', 
-                     marker='o', markersize=8, linewidth=2.5, label='Validation MAE')
-        
-        # Identify and annotate the optimal performance point
-        best_mae = min(val_values)
-        best_epoch = val_epochs[val_values.index(best_mae)]
-        
-        # Add dynamic annotation for the 'Best Model' checkpoint
-        ax[1].annotate(f'Best MAE: {best_mae:.2f}', 
-                       xy=(best_epoch, best_mae), 
-                       xytext=(best_epoch, best_mae + (max(val_values) - min(val_values)) * 0.15),
-                       arrowprops=dict(facecolor='black', shrink=0.05, width=1.2, headwidth=8),
-                       horizontalalignment='center', 
-                       fontweight='bold',
-                       bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#2980b9", alpha=0.8))
-
-    ax[1].set_title("Validation Accuracy (MAE)", pad=20, fontweight='bold')
-    ax[1].set_xlabel("Epochs")
-    ax[1].set_ylabel("Mean Absolute Error")
-    
-    # Clean up plot borders for a modern look
-    sns.despine()
-    plt.tight_layout()
-    
-    # Optional: Export at high resolution for presentations
-    # plt.savefig("model_performance_report.png", dpi=300, bbox_inches='tight')
-    plt.show()
-
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from torchvision import transforms
-import copy
-
-def run_project():
-    """
-    Main orchestration function for model training, validation, and convergence.
-    
-    This pipeline implements:
-    1. Data Preprocessing & Partitioning (80/10/10 ratio).
-    2. Dynamic Target Normalization (Z-score scaling).
-    3. Training loop with Early Stopping based on Validation MAE.
-    4. Best Model Checkpointing (Automatic restoration of optimal weights).
-    """
-    
-    # --- Configuration & Hyperparameters ---
-    MAX_EPOCHS = 10000    # High limit to allow full convergence to global minimum
-    PATIENCE = 50         # Stop if no improvement after 50 validation cycles
-    VALIDATION_FREQ = 5   # Frequency of validation performance checks
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 1. Data Transformation Pipeline
-    # Using 224x224 as the standard input resolution for DINOv2
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)), 
-        transforms.ToTensor(),
-    ])
-
-    # 2. Dataset Initialization & Splitting
-    dataset = PalletMultiViewDataset("./DataSet", transform=transform)
-    
-    # Splitting logic to ensure a dedicated test set for final evaluation
-    train_size = int(0.8 * len(dataset))
-    val_size = int(0.1 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size])
-
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=1)
-    
-    # 3. Target Statistics for Z-score Normalization
-    # Normalizing labels stabilizes the loss landscape for the AdamW optimizer
-    all_labels = torch.tensor([dataset[i][1].item() for i in range(len(dataset))])
-    _, target_mean, target_std = normalize_targets(all_labels)
-
-    # 4. Model, Optimizer, and Loss Initialization
-    model = DinoRegressorPRO().to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    criterion = nn.L1Loss() # MAE is more robust than MSE for this regression task
-
-    # 5. Tracking Variables for Convergence & Checkpointing
-    best_val_mae = float('inf')
-    epochs_no_improve = 0
-    best_model_wts = copy.deepcopy(model.state_dict())
-    
-    train_losses = []
-    val_maes = []
-
-    print(f"--- Starting Convergence Training on {DEVICE} ---")
-
-    for epoch in range(MAX_EPOCHS):
-        # --- TRAINING PHASE ---
-        model.train()
-        running_epoch_loss = 0
-        for imgs, labels, _ in train_loader:
-            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-            
-            # Target normalization to standardized units
-            labels_norm = (labels - target_mean) / target_std
-
-            optimizer.zero_grad()
-            outputs = model(imgs)
-            loss = criterion(outputs, labels_norm)
-            loss.backward()
-            optimizer.step()
-            
-            running_epoch_loss += loss.item()
-
-        train_losses.append(running_epoch_loss)
-
-        # --- VALIDATION PHASE (Early Stopping Logic) ---
-        if (epoch + 1) % VALIDATION_FREQ == 0:
-            model.eval()
-            current_val_mae_sum = 0
-            with torch.no_grad():
-                for imgs, labels, _ in val_loader:
-                    imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-                    
-                    # Inference & Denormalization to human-readable units (pallet count)
-                    preds_norm = model(imgs)
-                    preds = preds_norm * target_std + target_mean
-                    
-                    current_val_mae_sum += torch.abs(preds - labels).item()
-            
-            avg_val_mae = current_val_mae_sum / len(val_loader)
-            val_maes.append(avg_val_mae)
-            
-            print(f"Epoch {epoch+1:04d} | Loss: {running_epoch_loss:.4f} | Val MAE: {avg_val_mae:.4f}")
-
-            # Improvement Check
-            if avg_val_mae < best_val_mae:
-                best_val_mae = avg_val_mae
-                best_model_wts = copy.deepcopy(model.state_dict()) # Save best weights in memory
-                epochs_no_improve = 0
-                print("  >> New Global Minimum Detected. Checkpoint updated.")
-            else:
-                epochs_no_improve += 1
-        else:
-            val_maes.append(None) # Placeholders for consistent plotting indices
-
-        # Termination Criteria: Stop when model reaches a performance plateau
-        if epochs_no_improve >= PATIENCE:
-            print(f"\nConvergence reached. Early stopping triggered at epoch {epoch+1}.")
-            break
-
-    # 6. Post-Training: Final Parameter Restoration
-    model.load_state_dict(best_model_wts)
-    torch.save(model.state_dict(), "best_pallet_regressor_final.pth")
-    print(f"Process Complete. Optimal Validation MAE: {best_val_mae:.4f}")
-    
-    return train_losses, val_maes, test_ds, target_mean, target_std
-
-
-def run_project():
-    """
-    Complete project execution: Data prep, Training with Early Stopping, 
-    and Professional Metric Visualization.
-    """
-    
-    # --- Configuration ---
-    MAX_EPOCHS = 10000    
-    PATIENCE = 50         
-    VALIDATION_FREQ = 5   
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 1. Preprocessing
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)), 
-        transforms.ToTensor(),
-    ])
-
-    # 2. Dataset Partitioning
-    dataset = PalletMultiViewDataset("./DataSet", transform=transform)
-    train_size = int(0.8 * len(dataset))
-    val_size = int(0.1 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size])
-
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=1)
-    
-    # 3. Target Scaling (Z-score)
-    all_labels = torch.tensor([dataset[i][1].item() for i in range(len(dataset))])
-    _, target_mean, target_std = normalize_targets(all_labels)
-
-    # 4. Model Initialization
-    model = DinoRegressorPRO().to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    criterion = nn.L1Loss() 
-
-    # 5. Tracking Convergence
-    best_val_mae = float('inf')
-    epochs_no_improve = 0
-    best_model_wts = copy.deepcopy(model.state_dict())
-    
-    train_losses = []
-    val_maes = []
-
-    print(f"--- Initiating Training: Searching for Global Minimum on {DEVICE} ---")
-
-    for epoch in range(MAX_EPOCHS):
-        # --- TRAINING PHASE ---
-        model.train()
-        running_epoch_loss = 0
-        for imgs, labels, _ in train_loader:
-            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-            labels_norm = (labels - target_mean) / target_std
-
-            optimizer.zero_grad()
-            outputs = model(imgs)
-            loss = criterion(outputs, labels_norm)
-            loss.backward()
-            optimizer.step()
-            running_epoch_loss += loss.item()
-
-        train_losses.append(running_epoch_loss)
-
-        # --- VALIDATION PHASE & EARLY STOPPING ---
-        if (epoch + 1) % VALIDATION_FREQ == 0:
-            model.eval()
-            current_val_mae_sum = 0
-            with torch.no_grad():
-                for imgs, labels, _ in val_loader:
-                    imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-                    preds = model(imgs) * target_std + target_mean
-                    current_val_mae_sum += torch.abs(preds - labels).item()
-            
-            avg_val_mae = current_val_mae_sum / len(val_loader)
-            val_maes.append(avg_val_mae)
-            
-            print(f"Epoch {epoch+1:04d} | Loss: {running_epoch_loss:.4f} | Val MAE: {avg_val_mae:.4f}")
-
-            if avg_val_mae < best_val_mae:
-                best_val_mae = avg_val_mae
-                best_model_wts = copy.deepcopy(model.state_dict())
-                epochs_no_improve = 0
-                print("  >> Global Minimum Update: Checkpoint Saved.")
-            else:
-                epochs_no_improve += 1
-        else:
-            val_maes.append(None) 
-
-        if epochs_no_improve >= PATIENCE:
-            print(f"\nConvergence threshold reached at epoch {epoch+1}.")
-            break
-
-    # 6. Restoration & Final Export
-    model.load_state_dict(best_model_wts)
-    torch.save(model.state_dict(), "best_pallet_regressor.pth")
-    
-    # 7. AUTOMATED VISUAL REPORTING
-    print("\nGenerating Final Performance Report...")
-    plot_metrics(train_losses, val_maes)
-    
-    return train_losses, val_maes
